@@ -1,11 +1,8 @@
 import os
 import re
-import shutil
-import tempfile
 import uuid
 from collections import Counter
 from html import escape
-from pathlib import Path
 
 import chromadb
 import streamlit as st
@@ -21,7 +18,6 @@ from templates import bot_template, css, user_template
 
 load_dotenv()
 GOOGLE_API_KEY = os.getenv("google_api_key")
-CHROMA_BASE_PATH = Path(tempfile.gettempdir()) / "multi_pdf_chatbot_chroma"
 EMBEDDING_MODEL = "sentence-transformers/paraphrase-MiniLM-L3-v2"
 
 SMALL_TALK_RESPONSES = {
@@ -130,11 +126,8 @@ def get_text_chunks(documents):
 
 
 def get_vectorstore(text_chunks):
-    chroma_path = st.session_state.chroma_path
     collection_name = st.session_state.collection_name
-    delete_chroma_collection(chroma_path=chroma_path, collection_name=collection_name)
-    Path(chroma_path).mkdir(parents=True, exist_ok=True)
-    client = chromadb.PersistentClient(path=chroma_path)
+    client = chromadb.EphemeralClient()
 
     return Chroma.from_documents(
         documents=text_chunks,
@@ -148,19 +141,18 @@ def get_conversation_chain(vectorstore):
     return {"llm": get_llm(), "vectorstore": vectorstore}
 
 
-def delete_chroma_collection(client=None, chroma_path=None, collection_name=None):
+def delete_chroma_collection(client=None, collection_name=None):
     collection_name = collection_name or st.session_state.get("collection_name")
-    chroma_path = chroma_path or st.session_state.get("chroma_path")
-    if not collection_name or not chroma_path:
+    if not collection_name:
         return
 
-    client = client or chromadb.PersistentClient(path=chroma_path)
+    if client is None:
+        return
+
     try:
         client.delete_collection(collection_name)
     except Exception:
         pass
-
-    shutil.rmtree(chroma_path, ignore_errors=True)
 
 
 def format_sources(documents):
@@ -269,7 +261,6 @@ def reset_documents():
     if vectorstore is not None and hasattr(vectorstore, "_client"):
         delete_chroma_collection(
             vectorstore._client,
-            chroma_path=st.session_state.chroma_path,
             collection_name=st.session_state.collection_name,
         )
     else:
@@ -301,8 +292,6 @@ def initialize_session_state():
         st.session_state.session_id = uuid.uuid4().hex
     if "collection_name" not in st.session_state:
         st.session_state.collection_name = f"pdf_collection_{st.session_state.session_id}"
-    if "chroma_path" not in st.session_state:
-        st.session_state.chroma_path = str(CHROMA_BASE_PATH / st.session_state.session_id)
 
 
 def render_document_status():
