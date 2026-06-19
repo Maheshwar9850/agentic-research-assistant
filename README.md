@@ -81,16 +81,6 @@ State["llm"].invoke(prompt)
    └─► Except (429/Quota) ─► Update State Metrics ─► Fallback: Groq (Llama-3.3-70b)
 ```
 
-## 📸 Screenshots
-
-*(Replace placeholders with actual images in a `/docs` folder)*
-
-- **[Home Page Placeholder]** - Show the main chat interface and sidebar metrics.
-- **[Deep Research Mode Placeholder]** - Show the toggle active and a structured 4-part report response.
-- **[Workflow Trace Placeholder]** - Show the expanded `st.expander` revealing relevance scores and retrieved chunks.
-- **[Web Search Fallback Placeholder]** - Show a query that successfully triggered Tavily web search.
-- **[Groq Failover Placeholder]** - Show the sidebar metric reflecting `Current LLM: Groq` and `Fallbacks: 1`.
-
 ## 🚀 Installation & Setup
 
 ### Prerequisites
