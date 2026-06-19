@@ -13,6 +13,8 @@ from langchain_core.documents import Document
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from PyPDF2 import PdfReader
+from graph import run_deep_research_graph, run_rag_graph
+from llm_factory import get_llm
 from templates import bot_template, css, user_template
 
 
@@ -30,26 +32,38 @@ SMALL_TALK_RESPONSES = {
 }
 
 
-def get_llm():
-    return ChatGoogleGenerativeAI(
-        model="gemini-2.5-flash",
-        google_api_key=GOOGLE_API_KEY,
-        temperature=0.2,
-    )
-
-
 def get_embeddings():
     return HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
 
 
-def render_message(role, message):
+def render_message(role, message, trace_data=None, sources=None):
     template = user_template if role == "user" else bot_template
     safe_message = escape(message).replace("\n", "<br>")
     st.write(template.replace("{{MSG}}", safe_message), unsafe_allow_html=True)
+    
+    if role == "bot":
+        if sources and isinstance(sources, list) and len(sources) > 0 and sources[0] != "No sources available":
+            st.markdown("**Sources:**")
+            cols = st.columns(min(len(sources), 3))
+            for idx, source in enumerate(sources):
+                with cols[idx % 3]:
+                    st.info(source, icon="📄")
+                    
+        if trace_data:
+            with st.expander("Workflow Trace", expanded=False):
+                st.markdown(f"**Rewritten Query:** `{trace_data.get('rewritten_question')}`")
+                st.markdown(f"**Documents Retrieved:** `{trace_data.get('relevant_docs_count')}`")
+                st.markdown(f"**Relevance Score:** `{trace_data.get('relevance_score')}`")
+                st.markdown(f"**Web Search Triggered:** `{'Yes' if trace_data.get('web_results_count') > 0 else 'No'}`")
 
 
-def add_message(role, message):
-    st.session_state.chat_history.append({"role": role, "message": message})
+def add_message(role, message, trace_data=None, sources=None):
+    st.session_state.chat_history.append({
+        "role": role, 
+        "message": message,
+        "trace_data": trace_data,
+        "sources": sources
+    })
 
 
 def is_small_talk(user_question):
@@ -155,84 +169,22 @@ def delete_chroma_collection(client=None, collection_name=None):
         pass
 
 
-def format_sources(documents):
-    seen = set()
-    sources = []
-
-    for doc in documents:
-        source = doc.metadata.get("source", "Unknown PDF")
-        page = doc.metadata.get("page", "unknown")
-        label = f"{source}, page {page}"
-        if label not in seen:
-            seen.add(label)
-            sources.append(label)
-
-    return sources
-
-
-def keyword_overlap_score(question, document):
-    question_terms = set(re.findall(r"\w+", question.lower()))
-    document_terms = set(re.findall(r"\w+", document.page_content.lower()))
-    if not question_terms:
-        return 0
-    return len(question_terms & document_terms)
-
-
-def rerank_documents(question, documents, top_k=4):
-    scored_docs = sorted(
-        documents,
-        key=lambda doc: keyword_overlap_score(question, doc),
-        reverse=True,
-    )
-    return scored_docs[:top_k]
-
-
-def build_prompt(user_question, relevant_docs):
-    context_blocks = []
-    for index, doc in enumerate(relevant_docs, start=1):
-        source = doc.metadata.get("source", "Unknown PDF")
-        page = doc.metadata.get("page", "unknown")
-        context_blocks.append(
-            f"[Source {index}: {source}, page {page}]\n{doc.page_content}"
-        )
-
-    context = "\n\n".join(context_blocks)
-    history = "\n".join(
-        f"{item['role'].title()}: {item['message']}"
-        for item in st.session_state.chat_history[-6:]
-    )
-
-    return f"""
-You are a helpful PDF question-answering assistant.
-Answer the user's question using only the provided PDF context.
-If the answer is not present in the context, say: "I don't know from the uploaded documents."
-Include short source citations using the filename and page number when you use document facts.
-
-Recent chat:
-{history}
-
-Question:
-{user_question}
-
-PDF context:
-{context}
-"""
-
-
 def answer_from_documents(user_question):
     vectorstore = st.session_state.conversation["vectorstore"]
-    candidate_docs = vectorstore.similarity_search(user_question, k=8)
-    relevant_docs = rerank_documents(user_question, candidate_docs, top_k=4)
+    llm = st.session_state.conversation["llm"]
+    
+    is_deep = st.session_state.get("deep_research_mode", False)
+    graph_runner = run_deep_research_graph if is_deep else run_rag_graph
 
-    prompt = build_prompt(user_question, relevant_docs)
-    response = st.session_state.conversation["llm"].invoke(prompt)
-    answer = response.content
-
-    sources = format_sources(relevant_docs)
-    if sources and "I don't know from the uploaded documents." not in answer:
-        answer += "\n\nSources: " + "; ".join(sources)
-
-    return answer
+    final_state = graph_runner(
+        question=user_question,
+        vectorstore=vectorstore,
+        llm=llm,
+        chat_history=st.session_state.chat_history,
+        conversation_memory=st.session_state.graph_memory,
+    )
+    st.session_state.graph_memory = final_state["conversation_memory"]
+    return final_state
 
 
 def handle_userinput(user_question):
@@ -249,9 +201,30 @@ def handle_userinput(user_question):
         )
         return
 
-    with st.spinner("Searching your PDFs..."):
-        answer = answer_from_documents(user_question)
-    add_message("bot", answer)
+    is_deep = st.session_state.get("deep_research_mode", False)
+    with st.spinner("Deep Researching..." if is_deep else "Searching your PDFs..."):
+        final_state = answer_from_documents(user_question)
+        
+    raw_answer = final_state.get("answer", "")
+    
+    import re
+    clean_answer = re.split(r"\n\s*(?:4\.\s*)?Sources\s*:?\s*", raw_answer, maxsplit=1, flags=re.IGNORECASE)[0].strip()
+
+    trace_data = {
+        "rewritten_question": final_state.get("rewritten_question", ""),
+        "relevant_docs_count": len(final_state.get("relevant_docs", [])),
+        "relevance_score": final_state.get("relevance_score", 0.0),
+        "web_results_count": len(final_state.get("web_results", [])),
+    }
+    
+    st.session_state.last_relevance_score = trace_data["relevance_score"]
+    if trace_data["web_results_count"] > 0:
+        st.session_state.web_search_count += 1
+        
+    st.session_state.current_provider = final_state["llm"].current_provider
+    st.session_state.fallback_count = final_state["llm"].fallback_count
+        
+    add_message("bot", clean_answer, trace_data=trace_data, sources=final_state.get("sources", []))
 
 
 def reset_documents():
@@ -267,6 +240,7 @@ def reset_documents():
         delete_chroma_collection()
 
     st.session_state.conversation = None
+    st.session_state.graph_memory = []
     st.session_state.file_stats = []
     st.session_state.chunk_count = 0
     st.session_state.index_status = "No documents indexed"
@@ -276,9 +250,15 @@ def initialize_session_state():
     defaults = {
         "conversation": None,
         "chat_history": [],
+        "graph_memory": [],
         "file_stats": [],
         "chunk_count": 0,
         "index_status": "No documents indexed",
+        "last_relevance_score": 0.0,
+        "web_search_count": 0,
+        "deep_research_mode": False,
+        "current_provider": "Gemini",
+        "fallback_count": 0,
     }
 
     for key, value in defaults.items():
@@ -287,6 +267,8 @@ def initialize_session_state():
 
     if not isinstance(st.session_state.chat_history, list):
         st.session_state.chat_history = []
+    if not isinstance(st.session_state.graph_memory, list):
+        st.session_state.graph_memory = []
 
     if "session_id" not in st.session_state:
         st.session_state.session_id = uuid.uuid4().hex
@@ -308,14 +290,14 @@ def render_document_status():
 
 
 def main():
-    st.set_page_config(page_title="Chat with multiple PDFs", page_icon=":books:")
+    st.set_page_config(page_title="Agentic Research Assistant", page_icon=":books:")
     st.write(css, unsafe_allow_html=True)
     initialize_session_state()
 
-    st.header("Chat with multiple PDFs :books:")
+    st.header("Agentic Research Assistant :books:")
 
     for item in st.session_state.chat_history:
-        render_message(item["role"], item["message"])
+        render_message(item["role"], item["message"], item.get("trace_data"), item.get("sources"))
 
     user_question = st.chat_input("Ask a question about your documents")
     if user_question:
@@ -323,7 +305,25 @@ def main():
         st.rerun()
 
     with st.sidebar:
-        st.subheader("Your documents")
+        st.title("Agent Status")
+        
+        st.toggle("Deep Research Mode", key="deep_research_mode")
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            st.metric("🤖 Current LLM", st.session_state.current_provider)
+            st.metric("Memory Entries", len(st.session_state.graph_memory))
+            st.metric("Docs Indexed", len(st.session_state.file_stats))
+            st.metric("Web Searches", st.session_state.web_search_count)
+        with col2:
+            st.metric("🔁 Fallbacks", st.session_state.fallback_count)
+            st.metric("Current Mode", "Deep Research" if st.session_state.deep_research_mode else "Chat")
+            st.metric("Chunks Indexed", st.session_state.chunk_count)
+            st.metric("Last Relevance", f"{st.session_state.last_relevance_score:.2f}")
+
+        st.divider()
+
+        st.subheader("Document Management")
         pdf_docs = st.file_uploader(
             "Upload your PDFs here and click on 'Process'",
             accept_multiple_files=True,

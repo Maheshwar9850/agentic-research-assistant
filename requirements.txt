@@ -5,7 +5,9 @@ langchain
 langchain-community
 langchain-core
 langchain-google-genai
+langgraph
 sentence-transformers
 python-dotenv
 langchain-text-splitters
 protobuf==3.20.3
+langchain-groq
